@@ -13,6 +13,34 @@ use std::{
     vec::Vec,
 };
 
+/// Rainfall fork addition (not upstream): when `CUDARC_DISABLE_ASYNC_ALLOC`
+/// is set (any non-empty value), every `CudaContext` constructor forces
+/// `has_async_alloc = false` regardless of what
+/// `CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED` reports — i.e. every
+/// [`CudaStream::alloc`]/[`CudaStream::alloc_zeros`] call routes through
+/// `cuMemAlloc` (`result::malloc_sync`) instead of `cuMemAllocAsync`
+/// (`result::malloc_async`), unconditionally.
+///
+/// Root-caused (rainfall-one/kona, `session-cerebra-perf-2026-08-21-paused`
+/// memory, 2026-08-25): on at least one real GPU passthrough environment
+/// (A100-40GB, VMware passthrough, driver 610.57.04 / CUDA 13.3.1), a
+/// `cuMemAllocAsync`-allocated buffer used inside a captured CUDA graph
+/// region reliably fails with `CUDA_ERROR_STREAM_CAPTURE_INVALIDATED` on
+/// the very first captured op touching it, while the identical capture
+/// against a `cuMemAlloc`-allocated buffer (or a captured op with no
+/// memory access at all, e.g. `cudaEventRecord`) succeeds cleanly — a
+/// 6-hypothesis diagnostic matrix isolated the async/pool allocator
+/// specifically, ruling out stream type (legacy/per-thread/explicit),
+/// capture mode (THREAD_LOCAL/GLOBAL, ruling out cross-thread interference
+/// from a multi-threaded host process), and driver/toolkit version
+/// (host and guest both confirmed on the same 610.57.04/13.3.1 pairing).
+/// Off by default (upstream's own hardware-capability-driven behavior is
+/// unchanged) — set only by a consumer that has independently confirmed
+/// this same failure mode on their own hardware.
+fn async_alloc_disabled_by_env() -> bool {
+    std::env::var_os("CUDARC_DISABLE_ASYNC_ALLOC").is_some_and(|v| !v.is_empty())
+}
+
 /// Represents a CUDA context on a certain device.
 ///
 /// - [`CudaContext::new()`] retains the device's primary context.
@@ -81,7 +109,7 @@ impl CudaContext {
                 sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED,
             )?;
             memory_pools_supported > 0
-        };
+        } && !async_alloc_disabled_by_env();
         let ctx = Arc::new(CudaContext {
             cu_device,
             cu_ctx,
@@ -153,7 +181,7 @@ impl CudaContext {
                 sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED,
             )?;
             memory_pools_supported > 0
-        };
+        } && !async_alloc_disabled_by_env();
         let ctx = Arc::new(CudaContext {
             cu_device,
             cu_ctx,
@@ -204,7 +232,7 @@ impl CudaContext {
                 sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED,
             )?;
             memory_pools_supported > 0
-        };
+        } && !async_alloc_disabled_by_env();
         let ctx = Arc::new(CudaContext {
             cu_device,
             cu_ctx,
