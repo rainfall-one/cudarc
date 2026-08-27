@@ -820,6 +820,19 @@ pub struct CudaSlice<T> {
     pub(crate) write: Option<CudaEvent>,
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) marker: PhantomData<*const T>,
+    /// `true` for every allocation made through the normal `alloc`/
+    /// `alloc_zeros`/`null` paths (Drop frees `cu_device_ptr` as usual).
+    /// `false` only for a non-owning view constructed by
+    /// [`CudaStream::upgrade_arena_offset`] into the middle of a larger
+    /// allocation this `CudaSlice` does not own -- `cu_device_ptr` in that
+    /// case is `base + offset`, which is NOT a pointer `cuMemFree`/
+    /// `cuMemFreeAsync` may legally be called on (only the exact base
+    /// pointer returned by the original allocation is a valid free
+    /// target), so Drop must skip the free entirely and let whoever owns
+    /// the base allocation manage its lifetime. Added for Cerebra's
+    /// CUDA-graph-capture arena allocator (2026-08-27) -- see
+    /// `docs/specs/convergence/cerebra.md` capture-arena section.
+    pub(crate) owns_memory: bool,
 }
 
 unsafe impl<T> Send for CudaSlice<T> {}
@@ -827,6 +840,9 @@ unsafe impl<T> Sync for CudaSlice<T> {}
 
 impl<T> Drop for CudaSlice<T> {
     fn drop(&mut self) {
+        if !self.owns_memory {
+            return;
+        }
         let ctx = &self.stream.ctx;
         if ctx.is_managing_stream_synchronization() {
             if let Some(read) = self.read.as_ref() {
@@ -1553,6 +1569,7 @@ impl CudaStream {
             write: None,
             stream: self.clone(),
             marker: PhantomData,
+            owns_memory: true,
         })
     }
 
@@ -1584,6 +1601,7 @@ impl CudaStream {
             write,
             stream: self.clone(),
             marker: PhantomData,
+            owns_memory: true,
         })
     }
 
@@ -2547,6 +2565,54 @@ impl CudaStream {
             write,
             stream: self.clone(),
             marker: PhantomData,
+            owns_memory: true,
+        }
+    }
+
+    /// Creates a non-owning [CudaSlice] view into an offset of an existing
+    /// allocation this stream does not itself own -- Drop never frees
+    /// `cu_device_ptr`. Built for a CUDA-graph-capture arena allocator: one
+    /// real allocation is made once (the arena), then every per-op
+    /// "allocation" during a capture pass is actually a bump-allocated
+    /// view into that one backing buffer via this constructor, so nothing
+    /// calls `cuMemAlloc`/`cuMemAllocAsync` during capture (illegal for
+    /// the sync path, and separately confirmed broken even in eager mode
+    /// on this project's specific GPU-passthrough hardware for the async
+    /// path -- see `docs/specs/convergence/cerebra.md`).
+    ///
+    /// # Safety
+    /// - `base + offset_bytes` through `base + offset_bytes + len *
+    ///   size_of::<T>()` must lie entirely within a single live
+    ///   allocation that outlives every `CudaSlice` constructed from it
+    ///   (the arena owning that allocation must not be dropped, or its
+    ///   backing memory freed, while this view or any clone/copy derived
+    ///   from it is still in use).
+    /// - The memory may not be valid for type `T` -- as with
+    ///   [`CudaStream::alloc`], the caller must ensure it is written
+    ///   before being read.
+    pub unsafe fn upgrade_arena_offset<T>(
+        self: &Arc<Self>,
+        base: sys::CUdeviceptr,
+        offset_bytes: usize,
+        len: usize,
+    ) -> CudaSlice<T> {
+        let cu_device_ptr = base + offset_bytes as sys::CUdeviceptr;
+        let (read, write) = if self.ctx.is_event_tracking() {
+            (
+                Some(self.ctx.new_event(None).unwrap()),
+                Some(self.ctx.new_event(None).unwrap()),
+            )
+        } else {
+            (None, None)
+        };
+        CudaSlice {
+            cu_device_ptr,
+            len,
+            read,
+            write,
+            stream: self.clone(),
+            marker: PhantomData,
+            owns_memory: false,
         }
     }
 }
