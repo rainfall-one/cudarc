@@ -1511,6 +1511,29 @@ impl<T: ValidAsZeroBits> PinnedHostSlice<T> {
         Ok(self.ptr)
     }
 
+    /// Returns the raw host pointer WITHOUT calling `self.event.synchronize()`
+    /// first. Added for CUDA-graph-capture use: `event.synchronize()` (a
+    /// blocking host-side `cuEventSynchronize`) is itself illegal to call
+    /// while ANY stream in the context is actively being captured --
+    /// confirmed live (rainfall-one, 2026-08-27),
+    /// `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED` from exactly this call,
+    /// even on a freshly-allocated slice whose event has never been
+    /// recorded against any stream. `as_mut_ptr`'s synchronize exists to
+    /// protect against writing over data a previous device read/write is
+    /// still in flight on; skipping it is only sound under the safety
+    /// conditions below.
+    ///
+    /// # Safety
+    /// The caller must independently guarantee no device operation is
+    /// concurrently reading or writing this slice's memory -- e.g. a
+    /// freshly allocated slice that has never yet been the source or
+    /// destination of any `memcpy`/kernel, or one whose prior use is
+    /// already known-complete some other way (a prior explicit
+    /// synchronize taken before entering a capture window, for example).
+    pub unsafe fn as_mut_ptr_unsynchronized(&mut self) -> *mut T {
+        self.ptr
+    }
+
     /// Waits for any scheduled work to complete and then returns a refernce
     /// to the host side data.
     pub fn as_slice(&self) -> Result<&[T], DriverError> {
