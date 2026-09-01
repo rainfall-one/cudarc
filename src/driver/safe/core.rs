@@ -2476,6 +2476,23 @@ impl CudaFunction {
         unsafe { result::function::get_function_attribute(self.cu_function, attribute) }
     }
 
+    /// Set the value of a specific attribute of this [CudaFunction] —
+    /// the mirror of [`CudaFunction::get_attribute`], wrapping
+    /// `cuFuncSetAttribute`. The primary use case is opting a kernel in
+    /// to more dynamic shared memory than the 48KB default
+    /// (`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`), which a
+    /// launch cannot request on its own.
+    ///
+    /// See [CUDA docs](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXEC.html#group__CUDA__EXEC_1g0e37dce0173bc883aa1e5b14dfec5fd3)
+    pub fn set_attribute(
+        &self,
+        attribute: CUfunction_attribute_enum,
+        value: i32,
+    ) -> Result<(), result::DriverError> {
+        self.module.ctx.bind_to_thread()?;
+        unsafe { result::function::set_function_attribute(self.cu_function, attribute, value) }
+    }
+
     /// Get the number of registers used per thread.
     pub fn num_regs(&self) -> Result<i32, result::DriverError> {
         self.get_attribute(CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_NUM_REGS)
